@@ -24,6 +24,10 @@ const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
+  // Full-message callback for non-registered chats.
+  // Used by runtime features that need minimal content from unregistered chats
+  // (for example, trigger handling) without broad DB persistence.
+  onAnyMessage?: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
@@ -169,41 +173,47 @@ export class WhatsAppChannel implements Channel {
         const isGroup = chatJid.endsWith('@g.us');
         this.opts.onChatMetadata(chatJid, timestamp, undefined, 'whatsapp', isGroup);
 
-        // Only deliver full message for registered groups
+        const content =
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          msg.message?.imageMessage?.caption ||
+          msg.message?.videoMessage?.caption ||
+          '';
+
+        // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
+        if (!content) continue;
+
+        const sender = msg.key.participant || msg.key.remoteJid || '';
+        const senderName = msg.pushName || sender.split('@')[0];
+
+        const fromMe = msg.key.fromMe || false;
+        // Detect bot messages: with own number, fromMe is reliable
+        // since only the bot sends from that number.
+        // With shared number, bot messages carry the assistant name prefix
+        // (even in DMs/self-chat) so we check for that.
+        const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
+          ? fromMe
+          : content.startsWith(`${ASSISTANT_NAME}:`);
+
+        const incoming = {
+          id: msg.key.id || '',
+          chat_jid: chatJid,
+          sender,
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: fromMe,
+          is_bot_message: isBotMessage,
+        };
+
+        // Registered chats flow into normal persistence/processing.
+        // Non-registered chats emit to an optional callback so callers can
+        // implement minimal trigger handling without storing all message content.
         const groups = this.opts.registeredGroups();
         if (groups[chatJid]) {
-          const content =
-            msg.message?.conversation ||
-            msg.message?.extendedTextMessage?.text ||
-            msg.message?.imageMessage?.caption ||
-            msg.message?.videoMessage?.caption ||
-            '';
-
-          // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
-          if (!content) continue;
-
-          const sender = msg.key.participant || msg.key.remoteJid || '';
-          const senderName = msg.pushName || sender.split('@')[0];
-
-          const fromMe = msg.key.fromMe || false;
-          // Detect bot messages: with own number, fromMe is reliable
-          // since only the bot sends from that number.
-          // With shared number, bot messages carry the assistant name prefix
-          // (even in DMs/self-chat) so we check for that.
-          const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
-            ? fromMe
-            : content.startsWith(`${ASSISTANT_NAME}:`);
-
-          this.opts.onMessage(chatJid, {
-            id: msg.key.id || '',
-            chat_jid: chatJid,
-            sender,
-            sender_name: senderName,
-            content,
-            timestamp,
-            is_from_me: fromMe,
-            is_bot_message: isBotMessage,
-          });
+          this.opts.onMessage(chatJid, incoming);
+        } else {
+          this.opts.onAnyMessage?.(chatJid, incoming);
         }
       }
     });

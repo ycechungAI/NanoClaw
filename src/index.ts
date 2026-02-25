@@ -21,7 +21,6 @@ import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runti
 import {
   deleteMessagesBySender,
   deleteSession,
-  getTriggerMessagesFromAllChats,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -56,6 +55,35 @@ let messageLoopRunning = false;
 let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const pendingAnyChatTriggers = new Map<string, NewMessage[]>();
+const recentAnyChatTriggerIds = new Set<string>();
+const recentAnyChatTriggerOrder: string[] = [];
+const MAX_RECENT_ANY_CHAT_TRIGGER_IDS = 5000;
+
+function markAnyChatTriggerSeen(msg: NewMessage): boolean {
+  const key = `${msg.chat_jid}:${msg.id}`;
+  if (recentAnyChatTriggerIds.has(key)) return false;
+
+  recentAnyChatTriggerIds.add(key);
+  recentAnyChatTriggerOrder.push(key);
+
+  if (recentAnyChatTriggerOrder.length > MAX_RECENT_ANY_CHAT_TRIGGER_IDS) {
+    const oldest = recentAnyChatTriggerOrder.shift();
+    if (oldest) recentAnyChatTriggerIds.delete(oldest);
+  }
+
+  return true;
+}
+
+function enqueueAnyChatTrigger(msg: NewMessage): void {
+  if (!markAnyChatTriggerSeen(msg)) return;
+  const existing = pendingAnyChatTriggers.get(msg.chat_jid);
+  if (existing) {
+    existing.push(msg);
+  } else {
+    pendingAnyChatTriggers.set(msg.chat_jid, [msg]);
+  }
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -473,47 +501,71 @@ async function processAnyChatTriggers(): Promise<void> {
   const mainGroup = registeredGroups[mainGroupJid];
   const allowedSenders = loadAllowedSenders();
   if (allowedSenders.length === 0) return;
+  const allowedSet = new Set(allowedSenders);
+  if (pendingAnyChatTriggers.size === 0) return;
 
-  const registeredJids = Object.keys(registeredGroups);
-  const triggerMessages = getTriggerMessagesFromAllChats(
-    lastTimestamp,
-    allowedSenders,
-    registeredJids,
-    ASSISTANT_NAME,
-  ).filter((m) => TRIGGER_PATTERN.test(m.content.trim()));
-
-  if (triggerMessages.length === 0) return;
-
-  // Group by originating chat
-  const byChatJid = new Map<string, NewMessage[]>();
-  for (const msg of triggerMessages) {
-    const existing = byChatJid.get(msg.chat_jid) || [];
-    existing.push(msg);
-    byChatJid.set(msg.chat_jid, existing);
-  }
-
-  for (const [chatJid, msgs] of byChatJid) {
+  for (const chatJid of Array.from(pendingAnyChatTriggers.keys())) {
     // Skip if already being processed
     if (queue.isActive(chatJid)) continue;
 
     const channel = findChannel(channels, chatJid);
     if (!channel) continue;
 
+    const queued = pendingAnyChatTriggers.get(chatJid);
+    if (!queued || queued.length === 0) {
+      pendingAnyChatTriggers.delete(chatJid);
+      continue;
+    }
+
+    // Detach current batch so messages that arrive while processing are not lost.
+    pendingAnyChatTriggers.set(chatJid, []);
+    const msgs = queued
+      .filter((m) =>
+        !m.is_bot_message &&
+        allowedSet.has(m.sender) &&
+        TRIGGER_PATTERN.test(m.content.trim()),
+      )
+      .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+    if (msgs.length === 0) {
+      const followups = pendingAnyChatTriggers.get(chatJid);
+      if (!followups || followups.length === 0) pendingAnyChatTriggers.delete(chatJid);
+      continue;
+    }
+
     const prompt = formatMessages(msgs);
+    const previousCursor = lastAgentTimestamp[chatJid] || '';
     lastAgentTimestamp[chatJid] = msgs[msgs.length - 1].timestamp;
     saveState();
 
     logger.info({ chatJid, count: msgs.length }, 'Processing @BiBi trigger from unregistered chat');
 
+    let outputSentToUser = false;
     await channel.setTyping?.(chatJid, true);
-    await runAgent(mainGroup, prompt, chatJid, async (result) => {
+    const output = await runAgent(mainGroup, prompt, chatJid, async (result) => {
       if (result.result) {
         const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
         const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-        if (text) await channel.sendMessage(chatJid, text);
+        if (text) {
+          outputSentToUser = true;
+          await channel.sendMessage(chatJid, text);
+        }
       }
     });
     await channel.setTyping?.(chatJid, false);
+
+    if (output === 'error' && !outputSentToUser) {
+      // Retry later if the agent failed before producing user-visible output.
+      lastAgentTimestamp[chatJid] = previousCursor;
+      saveState();
+      const followups = pendingAnyChatTriggers.get(chatJid) || [];
+      pendingAnyChatTriggers.set(chatJid, msgs.concat(followups));
+      logger.warn({ chatJid }, 'Retrying @BiBi trigger from unregistered chat after agent error');
+      continue;
+    }
+
+    const followups = pendingAnyChatTriggers.get(chatJid);
+    if (!followups || followups.length === 0) pendingAnyChatTriggers.delete(chatJid);
   }
 }
 
@@ -615,6 +667,14 @@ async function main(): Promise<void> {
           }
         }
       }
+    },
+    onAnyMessage: (_chatJid: string, msg: NewMessage) => {
+      // Unregistered chats are not persisted in messages.db.
+      // Capture only trigger-shaped messages for the cross-chat trigger path.
+      if (registeredGroups[_chatJid]) return;
+      if (msg.is_bot_message) return;
+      if (!TRIGGER_PATTERN.test(msg.content.trim())) return;
+      enqueueAnyChatTrigger(msg);
     },
     onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
       storeChatMetadata(chatJid, timestamp, name, channel, isGroup),

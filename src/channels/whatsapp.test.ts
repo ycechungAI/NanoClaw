@@ -361,8 +361,9 @@ describe('WhatsAppChannel', () => {
       );
     });
 
-    it('only emits metadata for unregistered groups', async () => {
-      const opts = createTestOpts();
+    it('emits metadata + onAnyMessage for unregistered groups', async () => {
+      const onAnyMessage = vi.fn();
+      const opts = createTestOpts({ onAnyMessage });
       const channel = new WhatsAppChannel(opts);
 
       await connectChannel(channel);
@@ -389,6 +390,15 @@ describe('WhatsAppChannel', () => {
         true,
       );
       expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(onAnyMessage).toHaveBeenCalledWith(
+        'unregistered@g.us',
+        expect.objectContaining({
+          id: 'msg-2',
+          content: 'Hello',
+          sender_name: 'Bob',
+          is_from_me: false,
+        }),
+      );
     });
 
     it('ignores status@broadcast messages', async () => {
