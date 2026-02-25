@@ -494,6 +494,46 @@ export function setSession(groupFolder: string, sessionId: string): void {
   ).run(groupFolder, sessionId);
 }
 
+/**
+ * Get messages containing the trigger from allowed senders in non-registered chats.
+ * Used to respond to @BiBi in any WhatsApp chat, not just registered groups.
+ */
+export function getTriggerMessagesFromAllChats(
+  lastTimestamp: string,
+  allowedSenders: string[],
+  excludeJids: string[],
+  botPrefix: string,
+): NewMessage[] {
+  if (allowedSenders.length === 0) return [];
+
+  const senderPlaceholders = allowedSenders.map(() => '?').join(',');
+  const sql = `
+    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    FROM messages
+    WHERE timestamp > ?
+      AND is_bot_message = 0
+      AND content NOT LIKE ?
+      AND content != '' AND content IS NOT NULL
+      AND sender IN (${senderPlaceholders})
+    ORDER BY timestamp
+  `;
+
+  const rows = db
+    .prepare(sql)
+    .all(lastTimestamp, `${botPrefix}:%`, ...allowedSenders) as NewMessage[];
+
+  return rows.filter((m) => !excludeJids.includes(m.chat_jid));
+}
+
+export function deleteMessagesBySender(chatJid: string, sender: string): void {
+  db.prepare('DELETE FROM messages WHERE chat_jid = ? AND sender = ? AND is_bot_message = 0')
+    .run(chatJid, sender);
+}
+
+export function deleteSession(groupFolder: string): void {
+  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+}
+
 export function getAllSessions(): Record<string, string> {
   const rows = db
     .prepare('SELECT group_folder, session_id FROM sessions')

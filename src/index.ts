@@ -1,11 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 
+
 import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
+  SESSION_MAX_AGE_MS,
   TRIGGER_PATTERN,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
@@ -17,6 +19,9 @@ import {
 } from './container-runner.js';
 import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runtime.js';
 import {
+  deleteMessagesBySender,
+  deleteSession,
+  getTriggerMessagesFromAllChats,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -141,12 +146,54 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
 
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
 
+  // Clear session if the group has been inactive beyond SESSION_MAX_AGE_MS.
+  // This prevents stale accumulated context from wasting tokens on the next call.
+  if (sessions[group.folder] && sinceTimestamp) {
+    const lastUsed = new Date(sinceTimestamp).getTime();
+    if (!isNaN(lastUsed) && Date.now() - lastUsed > SESSION_MAX_AGE_MS) {
+      logger.info({ group: group.name }, 'Session expired, starting fresh to save tokens');
+      delete sessions[group.folder];
+      deleteSession(group.folder);
+    }
+  }
+
+  let missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+
+  // Filter messages by allowed senders for main group
+  if (isMainGroup){
+    const allowedSendersPath = path.join(resolveGroupFolderPath(MAIN_GROUP_FOLDER),
+      'allowed_senders.json'
+    );
+
+    if (fs.existsSync(allowedSendersPath))
+    {
+      try {
+        const config = JSON.parse(fs.readFileSync(allowedSendersPath, 'utf-8'));
+          if(config.enabled && Array.isArray(config.allowedSenders)){
+            const filtered = missedMessages.filter(msg => config.allowedSenders.includes(msg.sender));
+            
+            if (filtered.length < missedMessages.length){
+              logger.info(
+                {
+                  total: missedMessages.length, filtered:
+                  filtered.length, blocked: missedMessages.length - filtered.length
+                },
+                'Filtered messages by allowed senders'
+              );
+            }
+            
+            missedMessages = filtered;
+          }
+      } catch (err) {
+        logger.warn({ err }, 'Failed to load allowed_senders.json' );
+      }
+    }
+  }
+  
   if (missedMessages.length === 0) return true;
-
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
+  // All groups require the @BiBi trigger
+  if (group.requiresTrigger !== false) {
     const hasTrigger = missedMessages.some((m) =>
       TRIGGER_PATTERN.test(m.content.trim()),
     );
@@ -348,12 +395,8 @@ async function startMessageLoop(): Promise<void> {
             continue;
           }
 
-          const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
+          // Only act on trigger messages (@BiBi required for all groups).
+          const needsTrigger = group.requiresTrigger !== false;
           if (needsTrigger) {
             const hasTrigger = groupMessages.some((m) =>
               TRIGGER_PATTERN.test(m.content.trim()),
@@ -390,10 +433,87 @@ async function startMessageLoop(): Promise<void> {
           }
         }
       }
+
+      // Handle @BiBi trigger from allowed senders in ANY chat (not just registered groups)
+      await processAnyChatTriggers();
+
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+  }
+}
+
+/**
+ * Load allowed senders config from main group's allowed_senders.json.
+ */
+function loadAllowedSenders(): string[] {
+  const allowedSendersPath = path.join(
+    resolveGroupFolderPath(MAIN_GROUP_FOLDER),
+    'allowed_senders.json',
+  );
+  if (!fs.existsSync(allowedSendersPath)) return [];
+  try {
+    const config = JSON.parse(fs.readFileSync(allowedSendersPath, 'utf-8'));
+    if (config.enabled && Array.isArray(config.allowedSenders)) return config.allowedSenders;
+  } catch { /* ignore */ }
+  return [];
+}
+
+/**
+ * Respond to @BiBi from allowed senders in unregistered chats.
+ * Uses the main group's agent but responds to the original chat.
+ */
+async function processAnyChatTriggers(): Promise<void> {
+  const mainGroupJid = Object.keys(registeredGroups).find(
+    (jid) => registeredGroups[jid].folder === MAIN_GROUP_FOLDER,
+  );
+  if (!mainGroupJid) return;
+
+  const mainGroup = registeredGroups[mainGroupJid];
+  const allowedSenders = loadAllowedSenders();
+  if (allowedSenders.length === 0) return;
+
+  const registeredJids = Object.keys(registeredGroups);
+  const triggerMessages = getTriggerMessagesFromAllChats(
+    lastTimestamp,
+    allowedSenders,
+    registeredJids,
+    ASSISTANT_NAME,
+  ).filter((m) => TRIGGER_PATTERN.test(m.content.trim()));
+
+  if (triggerMessages.length === 0) return;
+
+  // Group by originating chat
+  const byChatJid = new Map<string, NewMessage[]>();
+  for (const msg of triggerMessages) {
+    const existing = byChatJid.get(msg.chat_jid) || [];
+    existing.push(msg);
+    byChatJid.set(msg.chat_jid, existing);
+  }
+
+  for (const [chatJid, msgs] of byChatJid) {
+    // Skip if already being processed
+    if (queue.isActive(chatJid)) continue;
+
+    const channel = findChannel(channels, chatJid);
+    if (!channel) continue;
+
+    const prompt = formatMessages(msgs);
+    lastAgentTimestamp[chatJid] = msgs[msgs.length - 1].timestamp;
+    saveState();
+
+    logger.info({ chatJid, count: msgs.length }, 'Processing @BiBi trigger from unregistered chat');
+
+    await channel.setTyping?.(chatJid, true);
+    await runAgent(mainGroup, prompt, chatJid, async (result) => {
+      if (result.result) {
+        const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        if (text) await channel.sendMessage(chatJid, text);
+      }
+    });
+    await channel.setTyping?.(chatJid, false);
   }
 }
 
@@ -420,11 +540,47 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+function loadContactsFile(): void {
+  const contactsPath = path.join(process.cwd(), 'contacts.txt');
+  if (!fs.existsSync(contactsPath)) return;
+
+  const lines = fs.readFileSync(contactsPath, 'utf-8').split('\n');
+  let added = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const parts = trimmed.split('|').map((p) => p.trim());
+    if (parts.length < 3) continue;
+
+    const [phone, name, folder] = parts;
+    if (!phone || !name || !folder) continue;
+
+    const jid = `${phone}@s.whatsapp.net`;
+    if (registeredGroups[jid]) continue;
+
+    registerGroup(jid, {
+      name,
+      folder,
+      trigger: `@${ASSISTANT_NAME}`,
+      added_at: new Date().toISOString(),
+      requiresTrigger: false,
+    });
+    added++;
+  }
+
+  if (added > 0) {
+    logger.info({ added }, 'Loaded new contacts from contacts.txt');
+  }
+}
+
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  loadContactsFile();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
@@ -438,7 +594,28 @@ async function main(): Promise<void> {
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
-    onMessage: (_chatJid: string, msg: NewMessage) => storeMessage(msg),
+    onMessage: (_chatJid: string, msg: NewMessage) => {
+      storeMessage(msg);
+      // Immediately delete messages from blocked senders in the main group
+      const group = registeredGroups[_chatJid];
+      if (group && group.folder === MAIN_GROUP_FOLDER && !msg.is_bot_message) {
+        const allowedSendersPath = path.join(
+          resolveGroupFolderPath(MAIN_GROUP_FOLDER),
+          'allowed_senders.json',
+        );
+        if (fs.existsSync(allowedSendersPath)) {
+          try {
+            const config = JSON.parse(fs.readFileSync(allowedSendersPath, 'utf-8'));
+            if (config.enabled && Array.isArray(config.allowedSenders) && !config.allowedSenders.includes(msg.sender)) {
+              deleteMessagesBySender(_chatJid, msg.sender);
+              logger.info({ sender: msg.sender }, 'Deleted message from blocked sender');
+            }
+          } catch (err) {
+            logger.warn({ err }, 'Failed to check allowed_senders.json on message receipt');
+          }
+        }
+      }
+    },
     onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
       storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,

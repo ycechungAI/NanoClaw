@@ -96,48 +96,6 @@ function buildVolumeMounts(
     }
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
-  fs.mkdirSync(groupSessionsDir, { recursive: true });
-  const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(settingsFile, JSON.stringify({
-      env: {
-        // Enable agent swarms (subagent orchestration)
-        // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-        // Load CLAUDE.md from additional mounted directories
-        // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-        CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-        // Enable Claude's memory feature (persists user preferences between sessions)
-        // https://code.claude.com/docs/en/memory#manage-auto-memory
-        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-      },
-    }, null, 2) + '\n');
-  }
-
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
-  const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
-    }
-  }
-  mounts.push({
-    hostPath: groupSessionsDir,
-    containerPath: '/home/node/.claude',
-    readonly: false,
-  });
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
@@ -154,9 +112,11 @@ function buildVolumeMounts(
   // Copy agent-runner source into a per-group writable location so agents
   // can customize it (add tools, change behavior) without affecting other
   // groups. Recompiled on container startup via entrypoint.sh.
+  // Always sync from canonical source to prevent stale files after upgrades.
   const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
   const groupAgentRunnerDir = path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
+  if (fs.existsSync(agentRunnerSrc)) {
+    fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
   mounts.push({
@@ -178,19 +138,32 @@ function buildVolumeMounts(
   return mounts;
 }
 
-/**
- * Read allowed secrets from .env for passing to the container via stdin.
- * Secrets are never written to disk or mounted as files.
- */
 function readSecrets(): Record<string, string> {
-  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  return {};
 }
 
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
+  // Allow container to reach host Ollama instance
+  args.push('--add-host=host.docker.internal:host-gateway');
+
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Ollama configuration — read from model.txt if present
+  const ollamaUrl = process.env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434/v1';
+  let ollamaModel = process.env.OLLAMA_MODEL || 'qwen3-coder-next:cloud';
+  let ollamaFallback = process.env.OLLAMA_FALLBACK_MODEL || 'llama3.2';
+  try {
+    const modelTxt = fs.readFileSync(path.join(process.cwd(), 'model.txt'), 'utf-8');
+    const lines = modelTxt.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (lines[0]) ollamaModel = lines[0];
+    if (lines[1]) ollamaFallback = lines[1];
+  } catch { /* model.txt not found, use defaults */ }
+  args.push('-e', `OLLAMA_BASE_URL=${ollamaUrl}`);
+  args.push('-e', `OLLAMA_MODEL=${ollamaModel}`);
+  args.push('-e', `OLLAMA_FALLBACK_MODEL=${ollamaFallback}`);
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),

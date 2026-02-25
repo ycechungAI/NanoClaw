@@ -9,10 +9,17 @@ export function escapeXml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
+const MAX_MESSAGE_LENGTH = 2000;
+
 export function formatMessages(messages: NewMessage[]): string {
-  const lines = messages.map((m) =>
-    `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`,
-  );
+  const lines = messages.map((m) => {
+    let content = m.content;
+    if (content.length > MAX_MESSAGE_LENGTH) {
+      const truncated = content.length - MAX_MESSAGE_LENGTH;
+      content = content.slice(0, MAX_MESSAGE_LENGTH) + `... [${truncated} chars truncated]`;
+    }
+    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(content)}</message>`;
+  });
   return `<messages>\n${lines.join('\n')}\n</messages>`;
 }
 
