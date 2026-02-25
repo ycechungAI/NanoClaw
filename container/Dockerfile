@@ -25,12 +25,22 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# Install PicoClaw binary (ultra-lightweight subagent worker, ~10MB)
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "amd64" ]; then PC_ARCH="x86_64"; \
+    elif [ "$ARCH" = "arm64" ]; then PC_ARCH="arm64"; \
+    else echo "Unsupported arch: $ARCH" && exit 1; fi && \
+    curl -fsSL \
+      "https://github.com/sipeed/picoclaw/releases/download/v0.1.2/picoclaw_Linux_${PC_ARCH}.tar.gz" \
+      | tar -xz -C /usr/local/bin/ picoclaw && \
+    chmod +x /usr/local/bin/picoclaw
+
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Install agent-browser and claude-code globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code
+# Install agent-browser globally
+RUN npm install -g agent-browser
 
 # Create app directory
 WORKDIR /app

@@ -1,23 +1,25 @@
 /**
- * NanoClaw Agent Runner
+ * NanoClaw Ollama Agent Runner
  * Runs inside a container, receives config via stdin, outputs result to stdout
- *
- * Input protocol:
- *   Stdin: Full ContainerInput JSON (read until EOF, like before)
- *   IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
- *          Files: {type:"message", text:"..."}.json — polled and consumed
- *          Sentinel: /workspace/ipc/input/_close — signals session end
- *
- * Stdout protocol:
- *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
- *   Multiple results may be emitted (one per agent teams result).
- *   Final marker after loop ends signals completion.
  */
 
 import fs from 'fs';
 import path from 'path';
-import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
+import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import OpenAI from 'openai';
+import { SwarmManager } from './swarm.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
+const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+const IPC_DIR = '/workspace/ipc';
+const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
+const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const HISTORY_FILE = '/workspace/group/.ollama-history.json';
+const MAX_HISTORY_MESSAGES = 20;
 
 interface ContainerInput {
   prompt: string;
@@ -37,65 +39,19 @@ interface ContainerOutput {
   error?: string;
 }
 
-interface SessionEntry {
-  sessionId: string;
-  fullPath: string;
-  summary: string;
-  firstPrompt: string;
+type Message = OpenAI.Chat.ChatCompletionMessageParam;
+
+function writeOutput(output: ContainerOutput): void {
+  console.log(OUTPUT_START_MARKER);
+  console.log(JSON.stringify(output));
+  console.log(OUTPUT_END_MARKER);
 }
 
-interface SessionsIndex {
-  entries: SessionEntry[];
+function log(msg: string): void {
+  console.error(`[agent-runner] ${msg}`);
 }
 
-interface SDKUserMessage {
-  type: 'user';
-  message: { role: 'user'; content: string };
-  parent_tool_use_id: null;
-  session_id: string;
-}
-
-const IPC_INPUT_DIR = '/workspace/ipc/input';
-const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
-const IPC_POLL_MS = 500;
-
-/**
- * Push-based async iterable for streaming user messages to the SDK.
- * Keeps the iterable alive until end() is called, preventing isSingleUserTurn.
- */
-class MessageStream {
-  private queue: SDKUserMessage[] = [];
-  private waiting: (() => void) | null = null;
-  private done = false;
-
-  push(text: string): void {
-    this.queue.push({
-      type: 'user',
-      message: { role: 'user', content: text },
-      parent_tool_use_id: null,
-      session_id: '',
-    });
-    this.waiting?.();
-  }
-
-  end(): void {
-    this.done = true;
-    this.waiting?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      while (this.queue.length > 0) {
-        yield this.queue.shift()!;
-      }
-      if (this.done) return;
-      await new Promise<void>(r => { this.waiting = r; });
-      this.waiting = null;
-    }
-  }
-}
-
-async function readStdin(): Promise<string> {
+function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = '';
     process.stdin.setEncoding('utf8');
@@ -105,482 +61,453 @@ async function readStdin(): Promise<string> {
   });
 }
 
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+function sanitizeHistory(messages: Message[]): Message[] {
+  // Strip leading tool messages whose assistant tool_call was truncated away
+  let start = 0;
+  while (start < messages.length && (messages[start] as { role: string }).role === 'tool') {
+    start++;
+  }
+  const trimmed = messages.slice(start);
 
-function writeOutput(output: ContainerOutput): void {
-  console.log(OUTPUT_START_MARKER);
-  console.log(JSON.stringify(output));
-  console.log(OUTPUT_END_MARKER);
-}
-
-function log(message: string): void {
-  console.error(`[agent-runner] ${message}`);
-}
-
-function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
-  const projectDir = path.dirname(transcriptPath);
-  const indexPath = path.join(projectDir, 'sessions-index.json');
-
-  if (!fs.existsSync(indexPath)) {
-    log(`Sessions index not found at ${indexPath}`);
-    return null;
+  // Also strip a trailing assistant message that has tool_calls but no following tool response
+  // (session ended mid-tool-call)
+  if (trimmed.length > 0) {
+    const last = trimmed[trimmed.length - 1] as { role: string; tool_calls?: unknown[] };
+    if (last.role === 'assistant' && last.tool_calls && last.tool_calls.length > 0) {
+      return trimmed.slice(0, -1);
+    }
   }
 
+  return trimmed;
+}
+
+function loadHistory(): Message[] {
   try {
-    const index: SessionsIndex = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    const entry = index.entries.find(e => e.sessionId === sessionId);
-    if (entry?.summary) {
-      return entry.summary;
+    if (fs.existsSync(HISTORY_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+      if (Array.isArray(raw)) return sanitizeHistory(raw.slice(-MAX_HISTORY_MESSAGES));
     }
+  } catch { /* start fresh */ }
+  return [];
+}
+
+function saveHistory(history: Message[]): void {
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(history.slice(-MAX_HISTORY_MESSAGES), null, 2));
   } catch (err) {
-    log(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
+    log(`Failed to save history: ${err}`);
+  }
+}
+
+function buildSystemPrompt(isMain: boolean, assistantName: string): string {
+  const parts: string[] = [
+    `You are ${assistantName}, a personal AI assistant. You have access to tools for running bash commands, reading/writing files, and managing scheduled tasks. Be concise and helpful.`,
+    `Current time: ${new Date().toISOString()}`,
+  ];
+
+  const groupClaudeMd = '/workspace/group/CLAUDE.md';
+  if (fs.existsSync(groupClaudeMd)) {
+    parts.push('\n--- Group Memory ---\n' + fs.readFileSync(groupClaudeMd, 'utf-8'));
   }
 
-  return null;
+  if (!isMain) {
+    const globalClaudeMd = '/workspace/global/CLAUDE.md';
+    if (fs.existsSync(globalClaudeMd)) {
+      parts.push('\n--- Global Memory ---\n' + fs.readFileSync(globalClaudeMd, 'utf-8'));
+    }
+  }
+
+  return parts.join('\n');
 }
 
-/**
- * Archive the full transcript to conversations/ before compaction.
- */
-function createPreCompactHook(assistantName?: string): HookCallback {
-  return async (input, _toolUseId, _context) => {
-    const preCompact = input as PreCompactHookInput;
-    const transcriptPath = preCompact.transcript_path;
-    const sessionId = preCompact.session_id;
-
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      log('No transcript found for archiving');
-      return {};
-    }
-
-    try {
-      const content = fs.readFileSync(transcriptPath, 'utf-8');
-      const messages = parseTranscript(content);
-
-      if (messages.length === 0) {
-        log('No messages to archive');
-        return {};
-      }
-
-      const summary = getSessionSummary(sessionId, transcriptPath);
-      const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-
-      const conversationsDir = '/workspace/group/conversations';
-      fs.mkdirSync(conversationsDir, { recursive: true });
-
-      const date = new Date().toISOString().split('T')[0];
-      const filename = `${date}-${name}.md`;
-      const filePath = path.join(conversationsDir, filename);
-
-      const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
-      fs.writeFileSync(filePath, markdown);
-
-      log(`Archived conversation to ${filePath}`);
-    } catch (err) {
-      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    return {};
-  };
+function writeIpcFile(dir: string, data: object): void {
+  fs.mkdirSync(dir, { recursive: true });
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+  const filepath = path.join(dir, filename);
+  const tempPath = `${filepath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tempPath, filepath);
 }
 
-// Secrets to strip from Bash tool subprocess environments.
-// These are needed by claude-code for API auth but should never
-// be visible to commands Kit runs.
-const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
-
-function createSanitizeBashHook(): HookCallback {
-  return async (input, _toolUseId, _context) => {
-    const preInput = input as PreToolUseHookInput;
-    const command = (preInput.tool_input as { command?: string })?.command;
-    if (!command) return {};
-
-    const unsetPrefix = `unset ${SECRET_ENV_VARS.join(' ')} 2>/dev/null; `;
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        updatedInput: {
-          ...(preInput.tool_input as Record<string, unknown>),
-          command: unsetPrefix + command,
+const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'bash',
+      description: 'Execute a bash command in the container workspace.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'The bash command to run' },
         },
+        required: ['command'],
       },
-    };
-  };
-}
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read the contents of a file.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path to read' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Write content to a file (creates parent directories as needed).',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path to write' },
+          content: { type: 'string', description: 'Content to write' },
+        },
+        required: ['path', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_directory',
+      description: 'List files and directories at a path.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Directory path to list' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'send_message',
+      description: 'Send a message to the WhatsApp chat immediately (useful for progress updates).',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'Message text to send' },
+        },
+        required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'schedule_task',
+      description: 'Schedule a recurring or one-time task.',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'What the agent should do when the task runs' },
+          schedule_type: { type: 'string', enum: ['cron', 'interval', 'once'], description: 'cron=recurring at specific times, interval=every N milliseconds, once=run once' },
+          schedule_value: { type: 'string', description: 'Cron expression (e.g. "0 9 * * *"), milliseconds (e.g. "3600000"), or local ISO timestamp (e.g. "2026-03-01T09:00:00")' },
+          context_mode: { type: 'string', enum: ['group', 'isolated'], description: 'group=use chat history, isolated=fresh session' },
+        },
+        required: ['prompt', 'schedule_type', 'schedule_value'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_tasks',
+      description: 'List all scheduled tasks.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cancel_task',
+      description: 'Cancel and delete a scheduled task.',
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'The task ID to cancel' },
+        },
+        required: ['task_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'spawn_worker',
+      description: 'Spawn a PicoClaw subagent to work on a task in parallel. Returns immediately with a worker_id. Max 3 concurrent workers. Use poll_worker() to get results.',
+      parameters: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: 'The task for the worker to execute' },
+          context: { type: 'string', description: 'Optional background context to give the worker' },
+        },
+        required: ['task'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'poll_worker',
+      description: 'Check the status of a spawned worker and get its result when done. Call repeatedly until status is "done" or "error".',
+      parameters: {
+        type: 'object',
+        properties: {
+          worker_id: { type: 'string', description: 'The worker_id returned by spawn_worker' },
+        },
+        required: ['worker_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_workers',
+      description: 'List all active and recently completed PicoClaw workers.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+];
 
-function sanitizeFilename(summary: string): string {
-  return summary
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 50);
-}
-
-function generateFallbackName(): string {
-  const time = new Date();
-  return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
-}
-
-interface ParsedMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-function parseTranscript(content: string): ParsedMessage[] {
-  const messages: ParsedMessage[] = [];
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
-        if (text) messages.push({ role: 'user', content: text });
-      } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
-        const text = textParts.join('');
-        if (text) messages.push({ role: 'assistant', content: text });
-      }
-    } catch {
-    }
-  }
-
-  return messages;
-}
-
-function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null, assistantName?: string): string {
-  const now = new Date();
-  const formatDateTime = (d: Date) => d.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  });
-
-  const lines: string[] = [];
-  lines.push(`# ${title || 'Conversation'}`);
-  lines.push('');
-  lines.push(`Archived: ${formatDateTime(now)}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
-
-  for (const msg of messages) {
-    const sender = msg.role === 'user' ? 'User' : (assistantName || 'Assistant');
-    const content = msg.content.length > 2000
-      ? msg.content.slice(0, 2000) + '...'
-      : msg.content;
-    lines.push(`**${sender}**: ${content}`);
-    lines.push('');
-  }
-
-  return lines.join('\n');
-}
-
-/**
- * Check for _close sentinel.
- */
-function shouldClose(): boolean {
-  if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
-    try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
-    return true;
-  }
-  return false;
-}
-
-/**
- * Drain all pending IPC input messages.
- * Returns messages found, or empty array.
- */
-function drainIpcInput(): string[] {
+function executeTool(
+  name: string,
+  args: Record<string, unknown>,
+  chatJid: string,
+  groupFolder: string,
+  isMain: boolean,
+  swarm: SwarmManager,
+): string {
   try {
-    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-    const files = fs.readdirSync(IPC_INPUT_DIR)
-      .filter(f => f.endsWith('.json'))
-      .sort();
-
-    const messages: string[] = [];
-    for (const file of files) {
-      const filePath = path.join(IPC_INPUT_DIR, file);
-      try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        fs.unlinkSync(filePath);
-        if (data.type === 'message' && data.text) {
-          messages.push(data.text);
+    switch (name) {
+      case 'bash': {
+        try {
+          const output = execSync(String(args.command), {
+            cwd: '/workspace/group',
+            timeout: 30000,
+            encoding: 'utf-8',
+          });
+          return output.trim() || '(no output)';
+        } catch (err: unknown) {
+          const e = err as { message: string; stderr?: string };
+          return `Error: ${e.message}\n${e.stderr || ''}`.trim();
         }
-      } catch (err) {
-        log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
-        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
       }
+
+      case 'read_file': {
+        const content = fs.readFileSync(String(args.path), 'utf-8');
+        return content.length > 8000 ? content.slice(0, 8000) + '\n...(truncated)' : content;
+      }
+
+      case 'write_file': {
+        const filePath = String(args.path);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, String(args.content));
+        return 'File written.';
+      }
+
+      case 'list_directory': {
+        const entries = fs.readdirSync(String(args.path), { withFileTypes: true });
+        return entries.map(e => `${e.isDirectory() ? 'd' : 'f'} ${e.name}`).join('\n') || '(empty)';
+      }
+
+      case 'send_message': {
+        writeIpcFile(MESSAGES_DIR, {
+          type: 'message',
+          chatJid,
+          text: String(args.text),
+          groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        return 'Message sent.';
+      }
+
+      case 'schedule_task': {
+        writeIpcFile(TASKS_DIR, {
+          type: 'schedule_task',
+          prompt: String(args.prompt),
+          schedule_type: String(args.schedule_type),
+          schedule_value: String(args.schedule_value),
+          context_mode: String(args.context_mode || 'isolated'),
+          targetJid: chatJid,
+          createdBy: groupFolder,
+          timestamp: new Date().toISOString(),
+        });
+        return `Task scheduled: ${args.schedule_type} - ${args.schedule_value}`;
+      }
+
+      case 'list_tasks': {
+        const tasksFile = path.join(IPC_DIR, 'current_tasks.json');
+        if (!fs.existsSync(tasksFile)) return 'No scheduled tasks.';
+        const tasks = JSON.parse(fs.readFileSync(tasksFile, 'utf-8'));
+        const visible = isMain
+          ? tasks
+          : tasks.filter((t: { groupFolder: string }) => t.groupFolder === groupFolder);
+        if (visible.length === 0) return 'No scheduled tasks.';
+        return visible.map((t: { id: string; prompt: string; schedule_type: string; schedule_value: string; status: string; next_run: string }) =>
+          `[${t.id}] ${t.prompt.slice(0, 50)} (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${t.next_run || 'N/A'}`
+        ).join('\n');
+      }
+
+      case 'cancel_task': {
+        writeIpcFile(TASKS_DIR, {
+          type: 'cancel_task',
+          taskId: String(args.task_id),
+          groupFolder,
+          isMain,
+          timestamp: new Date().toISOString(),
+        });
+        return `Task ${args.task_id} cancellation requested.`;
+      }
+
+      case 'spawn_worker': {
+        const result = swarm.spawn(String(args.task), args.context ? String(args.context) : undefined);
+        return result.error
+          ? `Error: ${result.error}`
+          : `Worker spawned. worker_id: ${result.worker_id}. Use poll_worker("${result.worker_id}") to check status.`;
+      }
+
+      case 'poll_worker': {
+        const r = swarm.poll(String(args.worker_id));
+        if (r.error) return `Error: ${r.error}`;
+        const elapsed = ((r.elapsed_ms || 0) / 1000).toFixed(1);
+        if (r.status === 'running') return `Status: running (${elapsed}s elapsed). Check again later.`;
+        return `Status: ${r.status} (${elapsed}s)\n\n${r.result}`;
+      }
+
+      case 'list_workers': {
+        const workers = swarm.list();
+        if (workers.length === 0) return 'No active or recent workers.';
+        return workers.map((w) =>
+          `[${w.id}] ${w.status.toUpperCase()} (${(w.elapsed_ms / 1000).toFixed(1)}s): ${w.task_preview}`
+        ).join('\n');
+      }
+
+      default:
+        return `Unknown tool: ${name}`;
     }
-    return messages;
-  } catch (err) {
-    log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    return `Tool error: ${e.message || String(err)}`;
   }
 }
 
-/**
- * Wait for a new IPC message or _close sentinel.
- * Returns the messages as a single string, or null if _close.
- */
-function waitForIpcMessage(): Promise<string | null> {
-  return new Promise((resolve) => {
-    const poll = () => {
-      if (shouldClose()) {
-        resolve(null);
-        return;
-      }
-      const messages = drainIpcInput();
-      if (messages.length > 0) {
-        resolve(messages.join('\n'));
-        return;
-      }
-      setTimeout(poll, IPC_POLL_MS);
-    };
-    poll();
-  });
-}
+async function runAgent(
+  input: ContainerInput,
+  ollama: OpenAI,
+  primaryModel: string,
+  fallbackModel: string,
+): Promise<string> {
+  const systemPrompt = buildSystemPrompt(input.isMain, input.assistantName || 'BiBi');
+  const history = loadHistory();
+  const swarm = new SwarmManager();
 
-/**
- * Run a single query and stream results via writeOutput.
- * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
- * allowing agent teams subagents to run to completion.
- * Also pipes IPC messages into the stream during the query.
- */
-async function runQuery(
-  prompt: string,
-  sessionId: string | undefined,
-  mcpServerPath: string,
-  containerInput: ContainerInput,
-  sdkEnv: Record<string, string | undefined>,
-  resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
-  const stream = new MessageStream();
-  stream.push(prompt);
-
-  // Poll IPC for follow-up messages and _close sentinel during the query
-  let ipcPolling = true;
-  let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      stream.end();
-      ipcPolling = false;
-      return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
-    }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-  };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let messageCount = 0;
-  let resultCount = 0;
-
-  // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+  let prompt = input.prompt;
+  if (input.isScheduledTask) {
+    prompt = `[SCHEDULED TASK - not sent directly by a user]\n\n${prompt}`;
   }
 
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
-  const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
-      if (fs.statSync(fullPath).isDirectory()) {
-        extraDirs.push(fullPath);
-      }
-    }
-  }
-  if (extraDirs.length > 0) {
-    log(`Additional directories: ${extraDirs.join(', ')}`);
-  }
+  const messages: Message[] = [
+    { role: 'system', content: systemPrompt },
+    ...history,
+    { role: 'user', content: prompt },
+  ];
 
-  for await (const message of query({
-    prompt: stream,
-    options: {
-      cwd: '/workspace/group',
-      additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
-      resume: sessionId,
-      resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
-      env: sdkEnv,
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-      },
-      hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
-        PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
-      },
-    }
-  })) {
-    messageCount++;
-    const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
+  let model = primaryModel;
+  let triedFallback = false;
 
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
-    }
+  while (true) {
+    let completion: OpenAI.Chat.ChatCompletion;
 
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
-    }
-
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
-    }
-
-    if (message.type === 'result') {
-      resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      writeOutput({
-        status: 'success',
-        result: textResult || null,
-        newSessionId
+    try {
+      completion = await ollama.chat.completions.create({
+        model,
+        messages,
+        tools: TOOLS,
+        tool_choice: 'auto',
       });
+    } catch (err: unknown) {
+      const e = err as { message?: string; status?: number };
+      const msg = (e.message || String(err)).toLowerCase();
+      if (!triedFallback && model === primaryModel && (msg.includes('model') || msg.includes('not found') || e.status === 404)) {
+        log(`Primary model "${primaryModel}" unavailable, falling back to "${fallbackModel}"`);
+        model = fallbackModel;
+        triedFallback = true;
+        continue;
+      }
+      throw err;
+    }
+
+    const message = completion.choices[0].message;
+    messages.push(message as Message);
+
+    if (message.tool_calls && message.tool_calls.length > 0) {
+      for (const toolCall of message.tool_calls) {
+        log(`Tool: ${toolCall.function.name}`);
+        let args: Record<string, unknown> = {};
+        try { args = JSON.parse(toolCall.function.arguments); } catch { /* use empty */ }
+
+        const result = executeTool(
+          toolCall.function.name, args, input.chatJid, input.groupFolder, input.isMain, swarm,
+        );
+
+        messages.push({ role: 'tool', content: result, tool_call_id: toolCall.id, name: toolCall.function.name } as Message);
+      }
+    } else {
+      const response = message.content || '';
+      // Save history without system message
+      saveHistory(messages.slice(1) as Message[]);
+      return response;
     }
   }
-
-  ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
 async function main(): Promise<void> {
-  let containerInput: ContainerInput;
+  let input: ContainerInput;
 
   try {
     const stdinData = await readStdin();
-    containerInput = JSON.parse(stdinData);
-    // Delete the temp file the entrypoint wrote — it contains secrets
+    input = JSON.parse(stdinData);
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
+    log(`Input received for group: ${input.groupFolder}`);
   } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
-    });
+    writeOutput({ status: 'error', result: null, error: `Failed to parse input: ${err}` });
     process.exit(1);
   }
 
-  // Build SDK env: merge secrets into process.env for the SDK only.
-  // Secrets never touch process.env itself, so Bash subprocesses can't see them.
-  const sdkEnv: Record<string, string | undefined> = { ...process.env };
-  for (const [key, value] of Object.entries(containerInput.secrets || {})) {
-    sdkEnv[key] = value;
-  }
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434/v1';
+  const primaryModel = process.env.OLLAMA_MODEL || 'qwen3-coder-next:cloud';
+  const fallbackModel = process.env.OLLAMA_FALLBACK_MODEL || 'llama3.2';
 
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+  log(`Ollama: ${ollamaBaseUrl}, model: ${primaryModel} (fallback: ${fallbackModel})`);
 
-  let sessionId = containerInput.sessionId;
-  fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+  const ollama = new OpenAI({
+    baseURL: ollamaBaseUrl,
+    apiKey: 'ollama',
+  });
 
-  // Clean up stale _close sentinel from previous container runs
-  try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
-
-  // Build initial prompt (drain any pending IPC messages too)
-  let prompt = containerInput.prompt;
-  if (containerInput.isScheduledTask) {
-    prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
-  }
-  const pending = drainIpcInput();
-  if (pending.length > 0) {
-    log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    prompt += '\n' + pending.join('\n');
-  }
-
-  // Query loop: run query → wait for IPC message → run new query → repeat
-  let resumeAt: string | undefined;
   try {
-    while (true) {
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
-
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
-      if (queryResult.newSessionId) {
-        sessionId = queryResult.newSessionId;
-      }
-      if (queryResult.lastAssistantUuid) {
-        resumeAt = queryResult.lastAssistantUuid;
-      }
-
-      // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
-      if (queryResult.closedDuringQuery) {
-        log('Close sentinel consumed during query, exiting');
-        break;
-      }
-
-      // Emit session update so host can track it
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId });
-
-      log('Query ended, waiting for next IPC message...');
-
-      // Wait for the next message or _close sentinel
-      const nextMessage = await waitForIpcMessage();
-      if (nextMessage === null) {
-        log('Close sentinel received, exiting');
-        break;
-      }
-
-      log(`Got new message (${nextMessage.length} chars), starting new query`);
-      prompt = nextMessage;
-    }
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    log(`Agent error: ${errorMessage}`);
+    const result = await runAgent(input, ollama, primaryModel, fallbackModel);
+    log(`Done, response: ${result.length} chars`);
     writeOutput({
-      status: 'error',
-      result: null,
-      newSessionId: sessionId,
-      error: errorMessage
+      status: 'success',
+      result: result || null,
+      newSessionId: input.groupFolder,
     });
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    const errorMsg = e.message || String(err);
+    log(`Agent error: ${errorMsg}`);
+    writeOutput({ status: 'error', result: null, error: errorMsg });
     process.exit(1);
   }
 }
