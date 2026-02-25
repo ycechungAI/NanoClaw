@@ -8,6 +8,7 @@ dist/
 store/
 data/
 logs/
+*.db
 
 # Groups - only track base structure and specific CLAUDE.md files
 groups/*
@@ -20,7 +21,13 @@ groups/global/*
 
 # Secrets
 *.keys.json
+*.key
+*.pem
 .env
+.env.*
+
+# Shared/export directory
+SHARE/
 
 # OS
 .DS_Store
