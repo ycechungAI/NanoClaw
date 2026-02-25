@@ -86,11 +86,9 @@ Registers WhatsApp contacts so BiBi responds to them. Loaded automatically on st
 
 ```
 # Format: phone_number | display_name | folder_name
-PHONENUMBER | main          | main
-PHONENUMBER | Alice Smith    | alice-smith
-PHONENUMBER | Bob Jones    | bob-jones
-PHONENUMBER | Carol Lee  | carol-lee
-PHONENUMBER | Dave Park | dave-park
+11234567890 | main          | main
+11234567891 | Alice Smith   | alice-smith
+11234567892 | Bob Jones     | bob-jones
 ```
 
 Each contact gets its own isolated container and `CLAUDE.md` memory under `groups/<folder>/`.
