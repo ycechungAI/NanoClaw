@@ -204,6 +204,20 @@ async function runTask(
 }
 
 let schedulerRunning = false;
+let currentTimer: ReturnType<typeof setTimeout> | null = null;
+let currentLoop: (() => Promise<void>) | null = null;
+
+export function wakeScheduler(): void {
+  if (currentTimer) {
+    clearTimeout(currentTimer);
+    currentTimer = null;
+  }
+  if (currentLoop) {
+    currentLoop().catch((err) =>
+      logger.error({ err }, 'Error in manually awoken scheduler'),
+    );
+  }
+}
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
   if (schedulerRunning) {
@@ -211,9 +225,14 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
     return;
   }
   schedulerRunning = true;
-  logger.info('Scheduler loop started');
+  logger.info('Scheduler loop started (event-driven timers)');
 
-  const loop = async () => {
+  currentLoop = async () => {
+    if (currentTimer) {
+      clearTimeout(currentTimer);
+      currentTimer = null;
+    }
+
     try {
       const dueTasks = getDueTasks();
       if (dueTasks.length > 0) {
@@ -237,13 +256,40 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       logger.error({ err }, 'Error in scheduler loop');
     }
 
-    setTimeout(loop, SCHEDULER_POLL_INTERVAL);
+    try {
+      const allActive = getAllTasks().filter(
+        (t) => t.status === 'active' && t.next_run,
+      );
+      if (allActive.length > 0) {
+        const nextTaskTime = allActive.reduce((earliest, t) => {
+          const time = new Date(t.next_run!).getTime();
+          return time < earliest ? time : earliest;
+        }, Infinity);
+
+        const now = Date.now();
+        let delay = nextTaskTime - now;
+        if (delay < 0) delay = 0;
+
+        // setTimeout max is 2147483647 ms
+        if (delay > 2147483647) {
+          delay = 2147483647;
+        }
+
+        currentTimer = setTimeout(currentLoop!, delay);
+      }
+    } catch (err) {
+      logger.error({ err }, 'Error setting next scheduler timer');
+      currentTimer = setTimeout(currentLoop!, SCHEDULER_POLL_INTERVAL);
+    }
   };
 
-  loop();
+  currentLoop();
 }
 
 /** @internal - for tests only. */
 export function _resetSchedulerLoopForTests(): void {
   schedulerRunning = false;
+  if (currentTimer) clearTimeout(currentTimer);
+  currentTimer = null;
+  currentLoop = null;
 }

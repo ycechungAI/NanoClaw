@@ -13,13 +13,15 @@ interface QueuedTask {
 
 const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
+const MAX_QUEUE_SIZE = 100; // maximum pending tasks per container
+const MAX_WAITING_GROUPS = 1000; // maximum total waiting queues
 
 interface GroupState {
   active: boolean;
   idleWaiting: boolean;
   isTaskContainer: boolean;
   pendingMessages: boolean;
-  pendingTasks: QueuedTask[];
+  pendingTasks: Map<string, QueuedTask>;
   process: ChildProcess | null;
   containerName: string | null;
   groupFolder: string | null;
@@ -29,7 +31,7 @@ interface GroupState {
 export class GroupQueue {
   private groups = new Map<string, GroupState>();
   private activeCount = 0;
-  private waitingGroups: string[] = [];
+  private waitingGroups = new Set<string>();
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
@@ -42,7 +44,7 @@ export class GroupQueue {
         idleWaiting: false,
         isTaskContainer: false,
         pendingMessages: false,
-        pendingTasks: [],
+        pendingTasks: new Map<string, QueuedTask>(),
         process: null,
         containerName: null,
         groupFolder: null,
@@ -74,8 +76,13 @@ export class GroupQueue {
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
       state.pendingMessages = true;
-      if (!this.waitingGroups.includes(groupJid)) {
-        this.waitingGroups.push(groupJid);
+      if (!this.waitingGroups.has(groupJid)) {
+        if (this.waitingGroups.size < MAX_WAITING_GROUPS) {
+          this.waitingGroups.add(groupJid);
+        } else {
+          logger.warn({ groupJid }, 'Max waiting groups reached, dropping enqueue');
+          return;
+        }
       }
       logger.debug(
         { groupJid, activeCount: this.activeCount },
@@ -95,13 +102,18 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
 
     // Prevent double-queuing of the same task
-    if (state.pendingTasks.some((t) => t.id === taskId)) {
+    if (state.pendingTasks.has(taskId)) {
       logger.debug({ groupJid, taskId }, 'Task already queued, skipping');
       return;
     }
 
+    if (state.pendingTasks.size >= MAX_QUEUE_SIZE) {
+      logger.warn({ groupJid, taskId }, 'Pending task queue size limit reached, dropping task');
+      return;
+    }
+
     if (state.active) {
-      state.pendingTasks.push({ id: taskId, groupJid, fn });
+      state.pendingTasks.set(taskId, { id: taskId, groupJid, fn });
       if (state.idleWaiting) {
         this.closeStdin(groupJid);
       }
@@ -110,9 +122,16 @@ export class GroupQueue {
     }
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
-      state.pendingTasks.push({ id: taskId, groupJid, fn });
-      if (!this.waitingGroups.includes(groupJid)) {
-        this.waitingGroups.push(groupJid);
+      state.pendingTasks.set(taskId, { id: taskId, groupJid, fn });
+      if (!this.waitingGroups.has(groupJid)) {
+        if (this.waitingGroups.size < MAX_WAITING_GROUPS) {
+          this.waitingGroups.add(groupJid);
+        } else {
+          logger.warn({ groupJid }, 'Max waiting groups reached, dropping enqueue');
+          // Don't leak the task map if we can't drain it
+          state.pendingTasks.delete(taskId);
+          return;
+        }
       }
       logger.debug(
         { groupJid, taskId, activeCount: this.activeCount },
@@ -141,7 +160,7 @@ export class GroupQueue {
   notifyIdle(groupJid: string): void {
     const state = this.getGroup(groupJid);
     state.idleWaiting = true;
-    if (state.pendingTasks.length > 0) {
+    if (state.pendingTasks.size > 0) {
       this.closeStdin(groupJid);
     }
   }
@@ -279,8 +298,11 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
 
     // Tasks first (they won't be re-discovered from SQLite like messages)
-    if (state.pendingTasks.length > 0) {
-      const task = state.pendingTasks.shift()!;
+    if (state.pendingTasks.size > 0) {
+      const firstKey = state.pendingTasks.keys().next().value as string;
+      const task = state.pendingTasks.get(firstKey)!;
+      state.pendingTasks.delete(firstKey);
+      
       this.runTask(groupJid, task).catch((err) =>
         logger.error({ groupJid, taskId: task.id, err }, 'Unhandled error in runTask (drain)'),
       );
@@ -301,15 +323,20 @@ export class GroupQueue {
 
   private drainWaiting(): void {
     while (
-      this.waitingGroups.length > 0 &&
+      this.waitingGroups.size > 0 &&
       this.activeCount < MAX_CONCURRENT_CONTAINERS
     ) {
-      const nextJid = this.waitingGroups.shift()!;
+      const nextJid = this.waitingGroups.values().next().value as string;
+      this.waitingGroups.delete(nextJid);
+      
       const state = this.getGroup(nextJid);
 
       // Prioritize tasks over messages
-      if (state.pendingTasks.length > 0) {
-        const task = state.pendingTasks.shift()!;
+      if (state.pendingTasks.size > 0) {
+        const firstKey = state.pendingTasks.keys().next().value as string;
+        const task = state.pendingTasks.get(firstKey)!;
+        state.pendingTasks.delete(firstKey);
+
         this.runTask(nextJid, task).catch((err) =>
           logger.error({ groupJid: nextJid, taskId: task.id, err }, 'Unhandled error in runTask (waiting)'),
         );

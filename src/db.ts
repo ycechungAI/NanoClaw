@@ -31,6 +31,8 @@ function createSchema(database: Database.Database): void {
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
     CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_chat_timestamp ON messages(chat_jid, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_sender_timestamp ON messages(sender, timestamp);
 
     CREATE TABLE IF NOT EXISTS scheduled_tasks (
       id TEXT PRIMARY KEY,
@@ -507,6 +509,10 @@ export function getTriggerMessagesFromAllChats(
   if (allowedSenders.length === 0) return [];
 
   const senderPlaceholders = allowedSenders.map(() => '?').join(',');
+  const excludeClause = excludeJids.length > 0
+    ? `AND chat_jid NOT IN (${excludeJids.map(() => '?').join(',')})`
+    : '';
+
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
     FROM messages
@@ -515,14 +521,24 @@ export function getTriggerMessagesFromAllChats(
       AND content NOT LIKE ?
       AND content != '' AND content IS NOT NULL
       AND sender IN (${senderPlaceholders})
+      ${excludeClause}
     ORDER BY timestamp
   `;
 
+  const params: unknown[] = [
+    lastTimestamp,
+    `${botPrefix}:%`,
+    ...allowedSenders,
+  ];
+  if (excludeJids.length > 0) {
+    params.push(...excludeJids);
+  }
+
   const rows = db
     .prepare(sql)
-    .all(lastTimestamp, `${botPrefix}:%`, ...allowedSenders) as NewMessage[];
+    .all(...params) as NewMessage[];
 
-  return rows.filter((m) => !excludeJids.includes(m.chat_jid));
+  return rows;
 }
 
 export function deleteMessagesBySender(chatJid: string, sender: string): void {

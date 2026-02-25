@@ -1,17 +1,18 @@
 import fs from 'fs';
 import path from 'path';
 
+import chokidar from 'chokidar';
 import { CronExpressionParser } from 'cron-parser';
 
 import {
   DATA_DIR,
-  IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
+import { wakeScheduler } from './task-scheduler.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
@@ -41,21 +42,31 @@ export function startIpcWatcher(deps: IpcDeps): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
+  let ipcProcessing = false;
+  let ipcProcessingQueued = false;
+
   const processIpcFiles = async () => {
-    // Scan all group IPC directories (identity determined by directory)
-    let groupFolders: string[];
-    try {
-      groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
-        const stat = fs.statSync(path.join(ipcBaseDir, f));
-        return stat.isDirectory() && f !== 'errors';
-      });
-    } catch (err) {
-      logger.error({ err }, 'Error reading IPC base directory');
-      setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+    if (ipcProcessing) {
+      ipcProcessingQueued = true;
       return;
     }
+    ipcProcessing = true;
 
-    const registeredGroups = deps.registeredGroups();
+    try {
+      do {
+        ipcProcessingQueued = false;
+        let groupFolders: string[];
+        try {
+          groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
+            const stat = fs.statSync(path.join(ipcBaseDir, f));
+            return stat.isDirectory() && f !== 'errors';
+          });
+        } catch (err) {
+          logger.error({ err }, 'Error reading IPC base directory');
+          return;
+        }
+
+        const registeredGroups = deps.registeredGroups();
 
     for (const sourceGroup of groupFolders) {
       const isMain = sourceGroup === MAIN_GROUP_FOLDER;
@@ -144,12 +155,26 @@ export function startIpcWatcher(deps: IpcDeps): void {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
       }
     }
-
-    setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+      } while (ipcProcessingQueued);
+    } finally {
+      ipcProcessing = false;
+    }
   };
 
+  // Run immediately on start, and also listen to added JSON files.
   processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces)');
+  
+  chokidar.watch(ipcBaseDir, {
+    ignored: /(^|[\/\\])\../, // ignore dotfiles
+    ignoreInitial: true,      // we ran it once manually
+    depth: 2,
+  }).on('add', (filePath) => {
+    if (filePath.endsWith('.json')) {
+      processIpcFiles();
+    }
+  });
+
+  logger.info('IPC watcher started (per-group namespaces, event-driven)');
 }
 
 export async function processTaskIpc(
@@ -263,6 +288,7 @@ export async function processTaskIpc(
           status: 'active',
           created_at: new Date().toISOString(),
         });
+        wakeScheduler();
         logger.info(
           { taskId, sourceGroup, targetFolder, contextMode },
           'Task created via IPC',
@@ -275,6 +301,7 @@ export async function processTaskIpc(
         const task = getTaskById(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'paused' });
+          wakeScheduler();
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task paused via IPC',
@@ -293,6 +320,7 @@ export async function processTaskIpc(
         const task = getTaskById(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'active' });
+          wakeScheduler();
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task resumed via IPC',
@@ -311,6 +339,7 @@ export async function processTaskIpc(
         const task = getTaskById(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           deleteTask(data.taskId);
+          wakeScheduler();
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task cancelled via IPC',

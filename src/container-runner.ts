@@ -3,6 +3,7 @@
  * Spawns agent execution in containers and handles IPC
  */
 import { ChildProcess, exec, spawn } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -26,6 +27,24 @@ import { RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+let cachedModelConfig: { model: string; fallback: string; mtimeMs: number } | null = null;
+const agentRunnerSyncCache = new Map<string, number>();
+
+function getAgentRunnerMaxMtime(dir: string): number {
+  try {
+    const files = fs.readdirSync(dir);
+    let max = fs.statSync(dir).mtimeMs;
+    for (const file of files) {
+      const p = path.join(dir, file);
+      const mtime = fs.statSync(p).mtimeMs;
+      if (mtime > max) max = mtime;
+    }
+    return max;
+  } catch {
+    return 0;
+  }
+}
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -42,6 +61,31 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+}
+
+const MAX_LOG_RETAIN_COUNT = 20;
+
+async function rotateLogs(logsDir: string): Promise<void> {
+  try {
+    const files = await fs.promises.readdir(logsDir);
+    const logFiles = files.filter(f => f.startsWith('container-') && f.endsWith('.log'));
+    if (logFiles.length <= MAX_LOG_RETAIN_COUNT) return;
+
+    const stats = await Promise.all(
+      logFiles.map(async f => {
+        const fullPath = path.join(logsDir, f);
+        const stat = await fs.promises.stat(fullPath);
+        return { file: fullPath, mtimeMs: stat.mtimeMs };
+      })
+    );
+
+    stats.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    const toDelete = stats.slice(MAX_LOG_RETAIN_COUNT);
+    await Promise.all(toDelete.map(s => fs.promises.unlink(s.file)));
+  } catch (err) {
+    logger.debug({ err, logsDir }, 'Failed to rotate container logs');
+  }
 }
 
 interface VolumeMount {
@@ -116,8 +160,14 @@ function buildVolumeMounts(
   const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
   const groupAgentRunnerDir = path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
   if (fs.existsSync(agentRunnerSrc)) {
-    fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+    const maxMtime = getAgentRunnerMaxMtime(agentRunnerSrc);
+    const lastSyncMtime = agentRunnerSyncCache.get(group.folder) || 0;
+    
+    if (maxMtime > lastSyncMtime || !fs.existsSync(groupAgentRunnerDir)) {
+      fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
+      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+      agentRunnerSyncCache.set(group.folder, maxMtime);
+    }
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -156,10 +206,18 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
   let ollamaModel = process.env.OLLAMA_MODEL || 'qwen3-coder-next:cloud';
   let ollamaFallback = process.env.OLLAMA_FALLBACK_MODEL || 'llama3.2';
   try {
-    const modelTxt = fs.readFileSync(path.join(process.cwd(), 'model.txt'), 'utf-8');
-    const lines = modelTxt.split('\n').map((l) => l.trim()).filter(Boolean);
-    if (lines[0]) ollamaModel = lines[0];
-    if (lines[1]) ollamaFallback = lines[1];
+    const modelTxtPath = path.join(process.cwd(), 'model.txt');
+    const stat = fs.statSync(modelTxtPath);
+    if (cachedModelConfig && cachedModelConfig.mtimeMs === stat.mtimeMs) {
+      ollamaModel = cachedModelConfig.model;
+      ollamaFallback = cachedModelConfig.fallback;
+    } else {
+      const modelTxt = fs.readFileSync(modelTxtPath, 'utf-8');
+      const lines = modelTxt.split('\n').map((l) => l.trim()).filter(Boolean);
+      if (lines[0]) ollamaModel = lines[0];
+      if (lines[1]) ollamaFallback = lines[1];
+      cachedModelConfig = { model: ollamaModel, fallback: ollamaFallback, mtimeMs: stat.mtimeMs };
+    }
   } catch { /* model.txt not found, use defaults */ }
   args.push('-e', `OLLAMA_BASE_URL=${ollamaUrl}`);
   args.push('-e', `OLLAMA_MODEL=${ollamaModel}`);
@@ -386,6 +444,7 @@ export async function runContainerAgent(
               newSessionId,
             });
           });
+          rotateLogs(logsDir);
           return;
         }
 
@@ -399,6 +458,7 @@ export async function runContainerAgent(
           result: null,
           error: `Container timed out after ${configTimeout}ms`,
         });
+        rotateLogs(logsDir);
         return;
       }
 
@@ -458,6 +518,7 @@ export async function runContainerAgent(
 
       fs.writeFileSync(logFile, logLines.join('\n'));
       logger.debug({ logFile, verbose: isVerbose }, 'Container log written');
+      rotateLogs(logsDir);
 
       if (code !== 0) {
         logger.error(
@@ -557,6 +618,17 @@ export async function runContainerAgent(
   });
 }
 
+const snapshotCache = new Map<string, string>();
+
+function writeSnapshotIfChanged(filePath: string, cacheKey: string, content: string): void {
+  const hash = crypto.createHash('md5').update(content).digest('hex');
+  if (snapshotCache.get(cacheKey) === hash) {
+    return;
+  }
+  fs.writeFileSync(filePath, content);
+  snapshotCache.set(cacheKey, hash);
+}
+
 export function writeTasksSnapshot(
   groupFolder: string,
   isMain: boolean,
@@ -580,7 +652,8 @@ export function writeTasksSnapshot(
     : tasks.filter((t) => t.groupFolder === groupFolder);
 
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
-  fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
+  const content = JSON.stringify(filteredTasks, null, 2);
+  writeSnapshotIfChanged(tasksFile, `tasks:${groupFolder}`, content);
 }
 
 export interface AvailableGroup {
@@ -608,15 +681,23 @@ export function writeGroupsSnapshot(
   const visibleGroups = isMain ? groups : [];
 
   const groupsFile = path.join(groupIpcDir, 'available_groups.json');
-  fs.writeFileSync(
-    groupsFile,
-    JSON.stringify(
-      {
-        groups: visibleGroups,
-        lastSync: new Date().toISOString(),
-      },
-      null,
-      2,
-    ),
+  const content = JSON.stringify(
+    {
+      groups: visibleGroups,
+      lastSync: new Date().toISOString(),
+    },
+    null,
+    2,
   );
+  
+  // Hash the group data explicitly ignoring the changing lastSync stamp
+  const pureContent = JSON.stringify(visibleGroups);
+  const hash = crypto.createHash('md5').update(pureContent).digest('hex');
+  const cacheKey = `groups:${groupFolder}`;
+  if (snapshotCache.get(cacheKey) === hash) {
+    return;
+  }
+  
+  fs.writeFileSync(groupsFile, content);
+  snapshotCache.set(cacheKey, hash);
 }

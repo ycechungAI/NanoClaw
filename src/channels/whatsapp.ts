@@ -19,6 +19,7 @@ import {
 } from '../db.js';
 import { logger } from '../logger.js';
 import { Channel, OnInboundMessage, OnChatMetadata, RegisteredGroup } from '../types.js';
+import { RingBuffer } from '../utils/queue.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -38,7 +39,7 @@ export class WhatsAppChannel implements Channel {
   private sock!: WASocket;
   private connected = false;
   private lidToPhoneMap: Record<string, string> = {};
-  private outgoingQueue: Array<{ jid: string; text: string }> = [];
+  private outgoingQueue = new RingBuffer<{ jid: string; text: string }>(1000);
   private flushing = false;
   private groupSyncTimerStarted = false;
 
@@ -92,7 +93,7 @@ export class WhatsAppChannel implements Channel {
         this.connected = false;
         const reason = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
         const shouldReconnect = reason !== DisconnectReason.loggedOut;
-        logger.info({ reason, shouldReconnect, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
+        logger.info({ reason, shouldReconnect, queuedMessages: this.outgoingQueue.size }, 'Connection closed');
 
         if (shouldReconnect) {
           logger.info('Reconnecting...');
@@ -229,8 +230,11 @@ export class WhatsAppChannel implements Channel {
       : `${ASSISTANT_NAME}: ${text}`;
 
     if (!this.connected) {
-      this.outgoingQueue.push({ jid, text: prefixed });
-      logger.info({ jid, length: prefixed.length, queueSize: this.outgoingQueue.length }, 'WA disconnected, message queued');
+      if (!this.outgoingQueue.push({ jid, text: prefixed })) {
+        logger.warn({ jid, length: prefixed.length }, 'WA disconnected, outgoing queue full, dropping message');
+      } else {
+        logger.info({ jid, length: prefixed.length, queueSize: this.outgoingQueue.size }, 'WA disconnected, message queued');
+      }
       return;
     }
     try {
@@ -238,8 +242,11 @@ export class WhatsAppChannel implements Channel {
       logger.info({ jid, length: prefixed.length }, 'Message sent');
     } catch (err) {
       // If send fails, queue it for retry on reconnect
-      this.outgoingQueue.push({ jid, text: prefixed });
-      logger.warn({ jid, err, queueSize: this.outgoingQueue.length }, 'Failed to send, message queued');
+      if (!this.outgoingQueue.push({ jid, text: prefixed })) {
+        logger.warn({ jid, err }, 'Failed to send, outgoing queue full, dropping message');
+      } else {
+        logger.warn({ jid, err, queueSize: this.outgoingQueue.size }, 'Failed to send, message queued');
+      }
     }
   }
 
@@ -330,11 +337,11 @@ export class WhatsAppChannel implements Channel {
   }
 
   private async flushOutgoingQueue(): Promise<void> {
-    if (this.flushing || this.outgoingQueue.length === 0) return;
+    if (this.flushing || this.outgoingQueue.size === 0) return;
     this.flushing = true;
     try {
-      logger.info({ count: this.outgoingQueue.length }, 'Flushing outgoing message queue');
-      while (this.outgoingQueue.length > 0) {
+      logger.info({ count: this.outgoingQueue.size }, 'Flushing outgoing message queue');
+      while (this.outgoingQueue.size > 0) {
         const item = this.outgoingQueue.shift()!;
         // Send directly — queued items are already prefixed by sendMessage
         await this.sock.sendMessage(item.jid, { text: item.text });
