@@ -1,0 +1,11 @@
+# Registered Contacts
+# Format: phone_number | name | folder
+# Add new contacts by running: npx tsx setup/index.ts --step register ...
+# Or have Claude Code add them directly to the SQLite DB.
+
+# Main control number (the WhatsApp account running the bot)
+11234567890 | main          | main
+
+# Additional contacts
+11234567891 | Alice Smith   | alice-smith
+11234567892 | Bob Jones     | bob-jones

@@ -29,6 +29,10 @@ groups/global/*
 # Shared/export directory
 SHARE/
 
+# Local config (use *.copy.txt as templates)
+contacts.txt
+model.txt
+
 # OS
 .DS_Store
 

@@ -1,0 +1,7 @@
+# model.txt — copy this to model.txt and fill in your models
+# Line 1: primary model
+# Line 2: fallback model (used if primary is unavailable)
+# Line 3: (optional) additional model
+
+your-primary-model
+llama3.2
