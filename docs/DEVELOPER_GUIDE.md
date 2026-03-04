@@ -85,9 +85,12 @@ Dashboard URL: `http://localhost:3838`
 
 ### Core runtime files
 
-- `src/index.ts` - Main orchestrator.
+- `src/index.ts` - Entrypoint; creates the runtime coordinator and starts the system.
+- `src/services/runtime-coordinator.ts` - Orchestrates queues, channels, scheduler, and IPC wiring.
+- `src/services/message-ingestion.ts` - Message ingestion loop, trigger handling, and allowed-sender gating.
 - `src/channels/whatsapp.ts` - WhatsApp integration.
-- `src/container-runner.ts` - Container spawn and streaming/output handling.
+- `src/container-runtime.ts` - Container runtime abstraction (Docker, Apple Container, etc.).
+- `src/container-runner.ts` - Container spawn, IPC wiring, and volume/mount setup.
 - `src/group-queue.ts` - Per-group queue and global container concurrency gating.
 - `src/ipc.ts` - File-based IPC processing.
 - `src/task-scheduler.ts` - Scheduled task execution.

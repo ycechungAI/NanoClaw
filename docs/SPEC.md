@@ -1,6 +1,6 @@
 # NanoClaw Specification
 
-A personal Claude assistant accessible via WhatsApp, with persistent memory per conversation, scheduled tasks, and email integration.
+A personal Claude assistant accessible via WhatsApp, with persistent memory per conversation and scheduled tasks. Optional email integration is available via skills such as `/add-gmail`.
 
 ---
 
@@ -98,9 +98,13 @@ nanoclaw/
 ├── .gitignore
 │
 ├── src/
-│   ├── index.ts                   # Orchestrator: state, message loop, agent invocation
+│   ├── index.ts                   # Entrypoint; creates the runtime coordinator and starts the system
+│   ├── services/
+│   │   ├── runtime-coordinator.ts # Orchestrates queues, channels, scheduler, and IPC wiring
+│   │   └── message-ingestion.ts   # Message ingestion loop, trigger handling, and allowed-sender gating
 │   ├── channels/
 │   │   └── whatsapp.ts            # WhatsApp connection, auth, send/receive
+│   ├── container-runtime.ts       # Container runtime abstraction (Docker, Apple Container, etc.)
 │   ├── ipc.ts                     # IPC watcher and task processing
 │   ├── router.ts                  # Message formatting and outbound routing
 │   ├── config.ts                  # Configuration constants
@@ -111,7 +115,7 @@ nanoclaw/
 │   ├── mount-security.ts          # Mount allowlist validation for containers
 │   ├── whatsapp-auth.ts           # Standalone WhatsApp authentication
 │   ├── task-scheduler.ts          # Runs scheduled tasks when due
-│   └── container-runner.ts        # Spawns agents in containers
+│   └── container-runner.ts        # Spawns agents in containers and handles IPC/mounts
 │
 ├── container/
 │   ├── Dockerfile                 # Container image (runs as 'node' user, includes Claude Code CLI)
@@ -171,42 +175,93 @@ nanoclaw/
 
 ## Configuration
 
-Configuration constants are in `src/config.ts`:
+Configuration constants are in `src/config.ts`; key fields:
 
 ```typescript
+import os from 'os';
 import path from 'path';
 
-export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Andy';
+import { readEnvFile } from './env.js';
+
+// Read config values from .env (falls back to process.env).
+// Secrets are NOT read here — they stay on disk and are loaded only
+// where needed (container-runner.ts) to avoid leaking to child processes.
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+]);
+
+export const ASSISTANT_NAME =
+  process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
+export const ASSISTANT_HAS_OWN_NUMBER =
+  (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
-// Paths are absolute (required for container mounts)
+// Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
+const HOME_DIR = process.env.HOME || os.homedir();
+
+// Mount security: allowlist stored OUTSIDE project root, never mounted into containers
+export const MOUNT_ALLOWLIST_PATH = path.join(
+  HOME_DIR,
+  '.config',
+  'nanoclaw',
+  'mount-allowlist.json',
+);
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+export const MAIN_GROUP_FOLDER = 'main';
 
-// Container configuration
-export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
-export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10); // 30min default
+export const CONTAINER_IMAGE =
+  process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
+export const CONTAINER_TIMEOUT = parseInt(
+  process.env.CONTAINER_TIMEOUT || '1800000',
+  10,
+);
+export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
+  process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
+  10,
+); // 10MB default
 export const IPC_POLL_INTERVAL = 1000;
-export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min — keep container alive after last result
-export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
+export const IDLE_TIMEOUT = parseInt(
+  process.env.IDLE_TIMEOUT || '300000',
+  10,
+); // 5min default — how long to keep container alive after last result
+export const SESSION_MAX_AGE_MS =
+  parseInt(process.env.SESSION_MAX_AGE_DAYS || '7', 10) * 24 * 60 * 60 * 1000;
+export const MAX_CONCURRENT_CONTAINERS = Math.max(
+  1,
+  parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
+);
 
-export const TRIGGER_PATTERN = new RegExp(`^@${ASSISTANT_NAME}\\b`, 'i');
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export const TRIGGER_PATTERN = new RegExp(
+  `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
+  'i',
+);
+
+// Timezone for scheduled tasks (cron expressions, etc.)
+// Uses system timezone by default
+export const TIMEZONE =
+  process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
 ```
 
-**Note:** Paths must be absolute for container volume mounts to work correctly.
+**Note:** Paths must be absolute for container volume mounts to work correctly, and the mount allowlist lives outside the project root so containers cannot modify it.
 
 ### Container Configuration
 
-Groups can have additional directories mounted via `containerConfig` in the SQLite `registered_groups` table (stored as JSON in the `container_config` column). Example registration:
+Groups can have additional directories mounted via `containerConfig` in the SQLite `registered_groups` table (stored as JSON in the `container_config` column). Example registration (using the default assistant name `Andy`; in this fork it is typically set to `BiBi` via environment variable):
 
 ```typescript
 registerGroup("1234567890@g.us", {
   name: "Dev Team",
   folder: "dev-team",
-  trigger: "@Andy",
+  trigger: "@BiBi",
   added_at: new Date().toISOString(),
   containerConfig: {
     additionalMounts: [
@@ -357,10 +412,10 @@ Sessions enable conversation continuity - Claude remembers what you talked about
 
 ### Trigger Word Matching
 
-Messages must start with the trigger pattern (default: `@Andy`):
-- `@Andy what's the weather?` → ✅ Triggers Claude
-- `@andy help me` → ✅ Triggers (case insensitive)
-- `Hey @Andy` → ❌ Ignored (trigger not at start)
+Messages must start with the trigger pattern (default: `@BiBi` in this fork, configurable via `ASSISTANT_NAME`):
+- `@BiBi what's the weather?` → ✅ Triggers Claude
+- `@bibi help me` → ✅ Triggers (case insensitive)
+- `Hey @BiBi` → ❌ Ignored (trigger not at start)
 - `What's up?` → ❌ Ignored (no trigger)
 
 ### Conversation Catch-Up
@@ -370,7 +425,7 @@ When a triggered message arrives, the agent receives all messages since its last
 ```
 [Jan 31 2:32 PM] John: hey everyone, should we do pizza tonight?
 [Jan 31 2:33 PM] Sarah: sounds good to me
-[Jan 31 2:35 PM] John: @Andy what toppings do you recommend?
+[Jan 31 2:35 PM] John: @BiBi what toppings do you recommend?
 ```
 
 This allows the agent to understand the conversation context even if it wasn't mentioned in every message.
@@ -383,16 +438,16 @@ This allows the agent to understand the conversation context even if it wasn't m
 
 | Command | Example | Effect |
 |---------|---------|--------|
-| `@Assistant [message]` | `@Andy what's the weather?` | Talk to Claude |
+| `@Assistant [message]` | `@BiBi what's the weather?` | Talk to Claude |
 
 ### Commands Available in Main Channel Only
 
 | Command | Example | Effect |
 |---------|---------|--------|
-| `@Assistant add group "Name"` | `@Andy add group "Family Chat"` | Register a new group |
-| `@Assistant remove group "Name"` | `@Andy remove group "Work Team"` | Unregister a group |
-| `@Assistant list groups` | `@Andy list groups` | Show registered groups |
-| `@Assistant remember [fact]` | `@Andy remember I prefer dark mode` | Add to global memory |
+| `@Assistant add group "Name"` | `@BiBi add group "Family Chat"` | Register a new group |
+| `@Assistant remove group "Name"` | `@BiBi remove group "Work Team"` | Unregister a group |
+| `@Assistant list groups` | `@BiBi list groups` | Show registered groups |
+| `@Assistant remember [fact]` | `@BiBi remember I prefer dark mode` | Add to global memory |
 
 ---
 
@@ -418,7 +473,7 @@ NanoClaw has a built-in scheduler that runs tasks as full agents in their group'
 ### Creating a Task
 
 ```
-User: @Andy remind me every Monday at 9am to review the weekly metrics
+User: @BiBi remind me every Monday at 9am to review the weekly metrics
 
 Claude: [calls mcp__nanoclaw__schedule_task]
         {
@@ -433,7 +488,7 @@ Claude: Done! I'll remind you every Monday at 9am.
 ### One-Time Tasks
 
 ```
-User: @Andy at 5pm today, send me a summary of today's emails
+User: @BiBi at 5pm today, send me a summary of today's emails (requires Gmail integration via `/add-gmail`)
 
 Claude: [calls mcp__nanoclaw__schedule_task]
         {
@@ -446,14 +501,14 @@ Claude: [calls mcp__nanoclaw__schedule_task]
 ### Managing Tasks
 
 From any group:
-- `@Andy list my scheduled tasks` - View tasks for this group
-- `@Andy pause task [id]` - Pause a task
-- `@Andy resume task [id]` - Resume a paused task
-- `@Andy cancel task [id]` - Delete a task
+- `@BiBi list my scheduled tasks` - View tasks for this group
+- `@BiBi pause task [id]` - Pause a task
+- `@BiBi resume task [id]` - Resume a paused task
+- `@BiBi cancel task [id]` - Delete a task
 
 From main channel:
-- `@Andy list all tasks` - View tasks from all groups
-- `@Andy schedule task for "Family Chat": [prompt]` - Schedule for another group
+- `@BiBi list all tasks` - View tasks from all groups
+- `@BiBi schedule task for "Family Chat": [prompt]` - Schedule for another group
 
 ---
 
@@ -610,7 +665,7 @@ chmod 700 groups/
 | Session not continuing | Session ID not saved | Check SQLite: `sqlite3 store/messages.db "SELECT * FROM sessions"` |
 | Session not continuing | Mount path mismatch | Container user is `node` with HOME=/home/node; sessions must be at `/home/node/.claude/` |
 | "QR code expired" | WhatsApp session expired | Delete store/auth/ and restart |
-| "No groups registered" | Haven't added groups | Use `@Andy add group "Name"` in main |
+| "No groups registered" | Haven't added groups | Use `@BiBi add group "Name"` in main |
 
 ### Log Location
 

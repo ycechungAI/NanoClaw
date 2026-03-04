@@ -149,12 +149,15 @@ Single Node.js process. Agents execute in isolated Docker containers with filesy
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Orchestrator: state, message loop, agent invocation |
+| `src/index.ts` | Entrypoint: creates the runtime coordinator and starts the system |
+| `src/services/runtime-coordinator.ts` | Orchestrator: coordinates queues, channels, scheduler, and IPC wiring |
+| `src/services/message-ingestion.ts` | Message ingestion loop, trigger handling, and allowed-sender gating |
 | `src/channels/whatsapp.ts` | WhatsApp connection, auth, send/receive |
 | `src/ipc.ts` | IPC watcher and task processing |
 | `src/router.ts` | Message formatting and outbound routing |
 | `src/group-queue.ts` | Per-group queue with global concurrency limit |
-| `src/container-runner.ts` | Spawns agent containers, reads `model.txt` |
+| `src/container-runtime.ts` | Container runtime abstraction (Docker, Apple Container, etc.) |
+| `src/container-runner.ts` | Spawns agent containers, handles IPC and mounts, reads `model.txt` |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
 | `src/mount-security.ts` | Validates container mounts against allowlist |
