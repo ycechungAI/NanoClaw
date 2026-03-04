@@ -179,6 +179,8 @@ export class MessageIngestionService {
   public async startMessageLoop(): Promise<void> {
     logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
     this.wakeMessageLoop();
+    // Poll periodically to catch messages from non-WhatsApp sources (e.g. dashboard)
+    setInterval(() => this.wakeMessageLoop(), POLL_INTERVAL);
   }
 
   private async processMessages(): Promise<void> {
