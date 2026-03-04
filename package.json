@@ -22,7 +22,7 @@
     "chokidar": "^5.0.0",
     "cron-parser": "^5.5.0",
     "express": "^5.2.1",
-    "multer": "^2.0.2",
+    "multer": "^2.1.0",
     "node-pty": "^1.0.0",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
