@@ -25,22 +25,21 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PicoClaw binary (bundled in repo, no download needed)
-COPY bin/picoclaw-arm64 /usr/local/bin/picoclaw-arm64
-COPY bin/picoclaw-x86_64 /usr/local/bin/picoclaw-x86_64
+# Install PicoClaw binary
 RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "amd64" ]; then cp /usr/local/bin/picoclaw-x86_64 /usr/local/bin/picoclaw; \
-    elif [ "$ARCH" = "arm64" ]; then cp /usr/local/bin/picoclaw-arm64 /usr/local/bin/picoclaw; \
+    if [ "$ARCH" = "amd64" ]; then \
+        curl -L -o /usr/local/bin/picoclaw https://github.com/qwibitai/picoclaw/releases/latest/download/picoclaw-x86_64; \
+    elif [ "$ARCH" = "arm64" ]; then \
+        curl -L -o /usr/local/bin/picoclaw https://github.com/qwibitai/picoclaw/releases/latest/download/picoclaw-arm64; \
     else echo "Unsupported arch: $ARCH" && exit 1; fi && \
-    chmod +x /usr/local/bin/picoclaw && \
-    rm /usr/local/bin/picoclaw-arm64 /usr/local/bin/picoclaw-x86_64
+    chmod +x /usr/local/bin/picoclaw
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Update npm to latest major version, then install agent-browser globally
-RUN npm install -g npm@latest agent-browser
+# Install agent-browser globally
+RUN npm install -g agent-browser
 
 # Create app directory
 WORKDIR /app

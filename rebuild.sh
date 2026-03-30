@@ -1,6 +1,12 @@
 #!/bin/bash
-# Full rebuild: clears Docker cache, rebuilds container image, recompiles TypeScript, restarts service
+# Full rebuild: fixes Docker config, prunes cache, rebuilds container, recompiles TypeScript, restarts service
 set -e
+
+# Fix Docker credential helper if needed
+if grep -q '"credsStore": "desktop"' ~/.docker/config.json 2>/dev/null; then
+    echo "==> Fixing Docker credential helper..."
+    echo '{"auths":{}}' > ~/.docker/config.json
+fi
 
 echo "==> Pruning Docker build cache..."
 docker builder prune -f
