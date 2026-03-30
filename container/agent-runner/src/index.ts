@@ -438,8 +438,8 @@ async function runAgent(
     } catch (err: unknown) {
       const e = err as { message?: string; status?: number };
       const msg = (e.message || String(err)).toLowerCase();
-      if (!triedFallback && model === primaryModel && (msg.includes('model') || msg.includes('not found') || e.status === 404 || e.status === 429 || msg.includes('rate limit') || msg.includes('too many requests') || msg.includes('usage limit'))) {
-        log(`Primary model "${primaryModel}" unavailable (${e.status ?? 'error'}), falling back to "${fallbackModel}"`);
+      if (!triedFallback && model === primaryModel && (msg.includes('model') || msg.includes('not found') || e.status === 404)) {
+        log(`Primary model "${primaryModel}" unavailable, falling back to "${fallbackModel}"`);
         model = fallbackModel;
         triedFallback = true;
         continue;

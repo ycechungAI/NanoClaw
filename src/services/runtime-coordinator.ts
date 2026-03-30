@@ -44,47 +44,24 @@ export class RuntimeCoordinator {
 
   private loadContactsFile(): void {
     const contactsPath = path.join(process.cwd(), 'contacts.txt');
+    if (!fs.existsSync(contactsPath)) return;
 
-    // Parse all valid JIDs currently in contacts.txt
-    const contactJids = new Set<string>();
-    const contactEntries: Array<{ jid: string; name: string; folder: string }> = [];
-
-    if (fs.existsSync(contactsPath)) {
-      const lines = fs.readFileSync(contactsPath, 'utf-8').split('\n');
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const parts = trimmed.split('|').map((p) => p.trim());
-        if (parts.length < 3) continue;
-        const [phone, name, folder] = parts;
-        if (!phone || !name || !folder) continue;
-        const jid = `${phone}@s.whatsapp.net`;
-        contactJids.add(jid);
-        contactEntries.push({ jid, name, folder });
-      }
-    }
-
-    // Remove contacts that are no longer in contacts.txt from the in-memory
-    // map so the bot stops responding to them. The DB record is intentionally
-    // left intact so message history is preserved and the contact can be
-    // re-enabled simply by adding the number back to contacts.txt.
-    // Only @s.whatsapp.net JIDs are ever added by this method; group chats
-    // (@g.us) are registered via /setup and must never be touched here.
-    let removed = 0;
-    for (const jid of Object.keys(this.conversation.registeredGroups)) {
-      if (jid.endsWith('@s.whatsapp.net') && !contactJids.has(jid)) {
-        delete this.conversation.registeredGroups[jid];
-        removed++;
-      }
-    }
-    if (removed > 0) {
-      logger.info({ removed }, 'Removed contacts no longer in contacts.txt');
-    }
-
-    // Add contacts that are new (not yet registered)
+    const lines = fs.readFileSync(contactsPath, 'utf-8').split('\n');
     let added = 0;
-    for (const { jid, name, folder } of contactEntries) {
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+
+      const parts = trimmed.split('|').map((p) => p.trim());
+      if (parts.length < 3) continue;
+
+      const [phone, name, folder] = parts;
+      if (!phone || !name || !folder) continue;
+
+      const jid = `${phone}@s.whatsapp.net`;
       if (this.conversation.registeredGroups[jid]) continue;
+
       this.conversation.registerGroup(jid, {
         name,
         folder,
@@ -94,6 +71,7 @@ export class RuntimeCoordinator {
       });
       added++;
     }
+
     if (added > 0) {
       logger.info({ added }, 'Loaded new contacts from contacts.txt');
     }

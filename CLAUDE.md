@@ -10,15 +10,12 @@ Single Node.js process that connects to WhatsApp, routes messages to Claude Agen
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Entrypoint: creates the runtime coordinator and starts the system |
-| `src/services/runtime-coordinator.ts` | Orchestrator: coordinates queues, channels, scheduler, and IPC wiring |
-| `src/services/message-ingestion.ts` | Message ingestion loop, trigger handling, and allowed-sender gating |
+| `src/index.ts` | Orchestrator: state, message loop, agent invocation |
 | `src/channels/whatsapp.ts` | WhatsApp connection, auth, send/receive |
 | `src/ipc.ts` | IPC watcher and task processing |
 | `src/router.ts` | Message formatting and outbound routing |
 | `src/config.ts` | Trigger pattern, paths, intervals |
-| `src/container-runtime.ts` | Container runtime abstraction (Docker, Apple Container, etc.) |
-| `src/container-runner.ts` | Spawns agent containers, handles IPC and mounts |
+| `src/container-runner.ts` | Spawns agent containers with mounts |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |

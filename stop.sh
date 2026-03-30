@@ -8,6 +8,7 @@ echo "==> Stopping NanoClaw launchd services..."
 
 PLISTS=(
   "com.nanoclaw|$HOME/Library/LaunchAgents/com.nanoclaw.plist"
+  "com.nanoclaw.dashboard|$HOME/Library/LaunchAgents/com.nanoclaw.dashboard.plist"
 )
 
 for entry in "${PLISTS[@]}"; do
@@ -30,5 +31,5 @@ fi
 
 echo "==> Done. All NanoClaw services stopped."
 echo ""
-echo "    To restart: launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist"
+echo "    To restart: launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist && launchctl load ~/Library/LaunchAgents/com.nanoclaw.dashboard.plist"
 echo "    To rebuild:  ./rebuild.sh"

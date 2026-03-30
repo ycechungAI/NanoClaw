@@ -600,10 +600,6 @@ export function getRegisteredGroup(
   };
 }
 
-export function deleteRegisteredGroup(jid: string): void {
-  db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
-}
-
 export function setRegisteredGroup(
   jid: string,
   group: RegisteredGroup,

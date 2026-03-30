@@ -3,9 +3,7 @@
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
 import { execSync } from 'child_process';
-import path from 'path';
 
-import { CONTAINER_IMAGE } from './config.js';
 import { logger } from './logger.js';
 
 /** The container runtime binary name. */
@@ -53,26 +51,6 @@ export function ensureContainerRuntimeRunning(): void {
       '╚════════════════════════════════════════════════════════════════╝\n',
     );
     throw new Error('Container runtime is required but failed to start');
-  }
-
-  // Auto-rebuild the agent image if it doesn't exist
-  try {
-    const output = execSync(
-      `${CONTAINER_RUNTIME_BIN} image inspect ${CONTAINER_IMAGE}`,
-      { stdio: 'pipe', encoding: 'utf-8' },
-    );
-    logger.debug({ image: CONTAINER_IMAGE }, 'Agent image present');
-    void output;
-  } catch {
-    logger.info({ image: CONTAINER_IMAGE }, 'Agent image missing, rebuilding...');
-    const buildScript = path.join(process.cwd(), 'container', 'build.sh');
-    try {
-      execSync(`bash "${buildScript}"`, { stdio: 'inherit', timeout: 600000 });
-      logger.info({ image: CONTAINER_IMAGE }, 'Agent image rebuilt successfully');
-    } catch (buildErr) {
-      logger.error({ err: buildErr }, 'Failed to rebuild agent image');
-      throw new Error(`Agent image ${CONTAINER_IMAGE} is missing and rebuild failed`);
-    }
   }
 }
 
