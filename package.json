@@ -39,7 +39,7 @@
     "music-metadata": ">=11.12.3",
     "prettier": "^3.8.1",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0",
+    "typescript": "^6.0.2",
     "vitest": "^4.0.18"
   },
   "engines": {
