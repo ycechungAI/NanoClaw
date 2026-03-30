@@ -54,7 +54,6 @@ echo "==> Starting NanoClaw launchd services..."
 
 PLISTS=(
     "com.nanoclaw|$HOME/Library/LaunchAgents/com.nanoclaw.plist"
-    "com.nanoclaw.dashboard|$HOME/Library/LaunchAgents/com.nanoclaw.dashboard.plist"
 )
 
 for entry in "${PLISTS[@]}"; do
