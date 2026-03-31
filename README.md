@@ -6,11 +6,6 @@
   Personal AI assistant (BiBi) — runs Claude agents securely in containers, reachable over WhatsApp, with a full web dashboard.
 </p>
 
-<p align="center">
-  <a href="https://nanoclaw.dev">nanoclaw.dev</a>&nbsp; • &nbsp;
-  <a href="README_zh.md">中文</a>&nbsp; • &nbsp;
-  <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>
-</p>
 
 This is a personal fork of [NanoClaw](https://github.com/qwibitai/NanoClaw). The assistant is named **BiBi** and runs on WhatsApp. Trigger BiBi in any chat with `@BiBi` (case-insensitive).
 
